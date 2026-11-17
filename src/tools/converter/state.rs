@@ -1,8 +1,6 @@
 //! 换算器的数据与状态：单位表、换算公式、输入编辑与结果显示。
 
 use crate::shared::number::format_plain;
-use gpui_kit::Keystroke;
-use gpui_kit::assets::IconName;
 
 /// 一个单位。
 pub struct UnitDef {
@@ -26,14 +24,13 @@ pub enum Scale {
 
 /// 一类换算。
 ///
-/// 这也是换算器分类唯一的描述表：菜单标题、菜单图标、存档标识、单位表与换算方式
+/// 这是换算器分类的描述表：菜单标题、存档标识、单位表与换算方式
 /// 都写在同一个 [`Category`] 里，顺序与 [`ConverterKind`] 的声明顺序一致。
+/// 菜单图标属于展示层，见 [`crate::app::page`] 的映射。
 pub struct Category {
     pub title: &'static str,
     /// 存档里的标识（`Page::as_str` 用它恢复页面）。
     pub slug: &'static str,
-    /// 菜单图标。
-    pub icon: IconName,
     pub units: &'static [UnitDef],
     pub scale: Scale,
     pub default_from: usize,
@@ -93,22 +90,22 @@ impl ConverterKind {
         self.category().title
     }
 
-    /// 菜单图标。
-    pub fn icon(self) -> IconName {
-        self.category().icon
-    }
-
     /// 存档里的标识。
     pub fn as_str(self) -> &'static str {
         self.category().slug
     }
+}
 
-    /// 从存档里的标识恢复分类。
-    pub fn from_str(value: &str) -> Option<Self> {
+impl std::str::FromStr for ConverterKind {
+    type Err = ();
+
+    /// 从存档里的标识恢复分类（`"length".parse::<ConverterKind>()`）。
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         ConverterKind::ALL
             .iter()
             .copied()
             .find(|kind| kind.as_str() == value)
+            .ok_or(())
     }
 }
 
@@ -251,7 +248,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "货币",
         slug: "currency",
-        icon: IconName::Banknote,
         units: CURRENCY_UNITS,
         scale: Scale::Linear,
         default_from: 0,
@@ -261,7 +257,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "体积",
         slug: "volume",
-        icon: IconName::Container,
         units: VOLUME_UNITS,
         scale: Scale::Linear,
         default_from: 1,
@@ -271,7 +266,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "长度",
         slug: "length",
-        icon: IconName::Ruler,
         units: LENGTH_UNITS,
         scale: Scale::Linear,
         default_from: 3,
@@ -281,7 +275,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "重量",
         slug: "weight",
-        icon: IconName::Weight,
         units: WEIGHT_UNITS,
         scale: Scale::Linear,
         default_from: 2,
@@ -291,7 +284,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "温度",
         slug: "temperature",
-        icon: IconName::Thermometer,
         units: TEMPERATURE_UNITS,
         scale: Scale::Temperature,
         default_from: 0,
@@ -301,7 +293,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "能量",
         slug: "energy",
-        icon: IconName::Flame,
         units: ENERGY_UNITS,
         scale: Scale::Linear,
         default_from: 1,
@@ -311,7 +302,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "面积",
         slug: "area",
-        icon: IconName::LandPlot,
         units: AREA_UNITS,
         scale: Scale::Linear,
         default_from: 2,
@@ -321,7 +311,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "速度",
         slug: "speed",
-        icon: IconName::Gauge,
         units: SPEED_UNITS,
         scale: Scale::Linear,
         default_from: 1,
@@ -331,7 +320,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "时间",
         slug: "time",
-        icon: IconName::Clock,
         units: TIME_UNITS,
         scale: Scale::Linear,
         default_from: 3,
@@ -341,7 +329,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "功率",
         slug: "power",
-        icon: IconName::Zap,
         units: POWER_UNITS,
         scale: Scale::Linear,
         default_from: 1,
@@ -351,7 +338,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "数据",
         slug: "data",
-        icon: IconName::Database,
         units: DATA_UNITS,
         scale: Scale::Linear,
         default_from: 4,
@@ -361,7 +347,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "压力",
         slug: "pressure",
-        icon: IconName::CircleGauge,
         units: PRESSURE_UNITS,
         scale: Scale::Linear,
         default_from: 1,
@@ -371,7 +356,6 @@ pub const CATEGORIES: [Category; 13] = [
     Category {
         title: "角度",
         slug: "angle",
-        icon: IconName::Compass,
         units: ANGLE_UNITS,
         scale: Scale::Linear,
         default_from: 0,
@@ -421,6 +405,16 @@ pub struct ConverterState {
     to: usize,
     /// 正在输入的文本。
     input: String,
+}
+
+/// 换算器可执行的语义动作（由 UI 层从按键翻译而来）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Action {
+    Digit(char),
+    Dot,
+    Negate,
+    Clear,
+    Backspace,
 }
 
 impl ConverterState {
@@ -552,28 +546,14 @@ impl ConverterState {
         }
     }
 
-    pub fn handle_key(&mut self, keystroke: &Keystroke) {
-        let modifiers = &keystroke.modifiers;
-        if modifiers.control || modifiers.alt || modifiers.platform {
-            return;
-        }
-
-        let typed = keystroke.key_char.as_deref().unwrap_or("");
-        let mut iter = typed.chars();
-        if let (Some(c), None) = (iter.next(), iter.next()) {
-            match c {
-                '0'..='9' => self.input_digit(c),
-                '.' => self.input_dot(),
-                '-' => self.negate(),
-                _ => {}
-            }
-            return;
-        }
-
-        match keystroke.key.as_str() {
-            "escape" | "delete" => self.clear(),
-            "backspace" => self.backspace(),
-            _ => {}
+    /// 分发一个语义动作；按键到动作的翻译见 [`crate::tools::converter::keystroke_to_action`]。
+    pub fn apply_action(&mut self, action: Action) {
+        match action {
+            Action::Digit(digit) => self.input_digit(digit),
+            Action::Dot => self.input_dot(),
+            Action::Negate => self.negate(),
+            Action::Clear => self.clear(),
+            Action::Backspace => self.backspace(),
         }
     }
 }
@@ -587,7 +567,8 @@ impl Default for ConverterState {
 #[cfg(test)]
 mod tests {
     use super::{
-        CATEGORIES, ConverterKind, ConverterState, Scale, celsius_to_unit, convert, unit_to_celsius,
+        Action, CATEGORIES, ConverterKind, ConverterState, Scale, celsius_to_unit, convert,
+        unit_to_celsius,
     };
     use crate::shared::number::format_plain;
 
@@ -625,9 +606,9 @@ mod tests {
             assert!(!slug.is_empty());
             assert!(!seen.contains(&slug), "存档标识 {slug} 重复");
             seen.push(slug);
-            assert_eq!(ConverterKind::from_str(slug), Some(kind));
+            assert_eq!(slug.parse::<ConverterKind>(), Ok(kind));
         }
-        assert_eq!(ConverterKind::from_str("unknown"), None);
+        assert_eq!("unknown".parse::<ConverterKind>(), Err(()));
     }
 
     #[test]
@@ -715,5 +696,36 @@ mod tests {
     #[test]
     fn result_formatting() {
         assert_eq!(format_plain(3.2808398950131), "3.2808398950131");
+    }
+
+    #[test]
+    fn apply_action_dispatches_to_semantic_methods() {
+        let mut state = ConverterState::new();
+        state.apply_action(Action::Digit('1'));
+        state.apply_action(Action::Digit('2'));
+        state.apply_action(Action::Dot);
+        state.apply_action(Action::Digit('5'));
+        assert_eq!(state.input_text(), "12.5");
+
+        state.apply_action(Action::Negate);
+        assert_eq!(state.input_text(), "-12.5");
+        state.apply_action(Action::Negate);
+        assert_eq!(state.input_text(), "12.5");
+    }
+
+    #[test]
+    fn apply_action_clear_and_backspace() {
+        let mut state = ConverterState::new();
+        state.apply_action(Action::Digit('7'));
+        state.apply_action(Action::Digit('8'));
+        state.apply_action(Action::Backspace);
+        assert_eq!(state.input_text(), "7");
+
+        state.apply_action(Action::Clear);
+        assert_eq!(state.input_text(), "0");
+
+        // 空输入上退格回到 0，而不是变负。
+        state.apply_action(Action::Backspace);
+        assert_eq!(state.input_text(), "0");
     }
 }

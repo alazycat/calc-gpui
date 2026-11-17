@@ -8,9 +8,9 @@
 //! 按「解析 → 状态 → 几何 → 绘制」拆成四个子模块，依赖方向单向：
 //!
 //! - [`expr`]：文本 → 可反复求值的表达式树（纯计算）；
-//! - [`state`]：输入、光标、已绘曲线与视口；
+//! - [`state`]：输入、光标、已绘曲线与视口，只消费纯数据的 [`Action`]；
 //! - [`scene`]：视口 + 曲线 → 网格 / 坐标轴 / 刻度（纯几何）；
-//! - [`view`]：`render` 与全部绘制函数。
+//! - [`view`]：`render`、按键 → [`Action`] 的翻译与全部绘制函数。
 //!
 //! 测试留在本文件：它们同时跨 [`expr`]、[`state`] 和 [`scene`] 三个子模块。
 
@@ -19,8 +19,8 @@ mod scene;
 mod state;
 mod view;
 
-pub use state::GraphState;
-pub use view::render;
+pub use state::{Action, GraphState};
+pub use view::{keystroke_to_action, render};
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,6 @@
 //! 换算器的界面：显示屏、单位选择行与数字键盘。
 
-use super::{Category, ConverterState};
+use super::{Action, Category, ConverterState};
 use crate::app::CalcApp;
 use crate::shared::number::format_plain;
 use crate::shared::ui::{self, Palette};
@@ -259,4 +259,110 @@ fn render_keypad(cx: &mut Context<CalcApp>, p: Palette) -> AnyElement {
             }),
         ]))
         .into_any_element()
+}
+
+/// 把按键翻译成语义动作。换算器键盘之外能用的键很少：
+/// 数字、小数点、负号，以及清零（Esc / Delete）与退格。
+pub fn keystroke_to_action(keystroke: &Keystroke) -> Option<Action> {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform {
+        return None;
+    }
+
+    let typed = keystroke.key_char.as_deref().unwrap_or("");
+    let mut iter = typed.chars();
+    if let (Some(c), None) = (iter.next(), iter.next()) {
+        let action = match c {
+            '0'..='9' => Action::Digit(c),
+            '.' => Action::Dot,
+            '-' => Action::Negate,
+            _ => return None,
+        };
+        return Some(action);
+    }
+
+    match keystroke.key.as_str() {
+        "escape" | "delete" => Some(Action::Clear),
+        "backspace" => Some(Action::Backspace),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, ConverterState, keystroke_to_action};
+    use gpui_kit::{Keystroke, Modifiers};
+
+    fn key(key: &str, key_char: Option<&str>) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: key.to_string(),
+            key_char: key_char.map(|s| s.to_string()),
+        }
+    }
+
+    fn typed(ch: char) -> Keystroke {
+        key("a", Some(&ch.to_string()))
+    }
+
+    fn named(key_name: &str) -> Keystroke {
+        key(key_name, None)
+    }
+
+    #[test]
+    fn digits_dot_and_negate_map_to_actions() {
+        assert_eq!(keystroke_to_action(&typed('7')), Some(Action::Digit('7')));
+        assert_eq!(keystroke_to_action(&typed('0')), Some(Action::Digit('0')));
+        assert_eq!(keystroke_to_action(&typed('.')), Some(Action::Dot));
+        assert_eq!(keystroke_to_action(&typed('-')), Some(Action::Negate));
+    }
+
+    #[test]
+    fn clear_keys_and_backspace_map_to_actions() {
+        assert_eq!(keystroke_to_action(&named("escape")), Some(Action::Clear));
+        assert_eq!(keystroke_to_action(&named("delete")), Some(Action::Clear));
+        assert_eq!(
+            keystroke_to_action(&named("backspace")),
+            Some(Action::Backspace)
+        );
+    }
+
+    #[test]
+    fn unknown_and_modifier_keys_are_ignored() {
+        // 换算器不接受的字符。
+        assert_eq!(keystroke_to_action(&typed('+')), None);
+        assert_eq!(keystroke_to_action(&typed('a')), None);
+        // 不在映射里的功能键。
+        assert_eq!(keystroke_to_action(&named("enter")), None);
+        assert_eq!(keystroke_to_action(&named("up")), None);
+        // 任何组合键都不参与输入。
+        let mut ctrl = typed('c');
+        ctrl.modifiers.control = true;
+        assert_eq!(keystroke_to_action(&ctrl), None);
+        let mut alt = typed('1');
+        alt.modifiers.alt = true;
+        assert_eq!(keystroke_to_action(&alt), None);
+    }
+
+    #[test]
+    fn keystrokes_drive_the_state_end_to_end() {
+        let mut state = ConverterState::new();
+        for keystroke in [typed('1'), typed('2'), typed('.'), typed('5'), typed('-')] {
+            if let Some(action) = keystroke_to_action(&keystroke) {
+                state.apply_action(action);
+            }
+        }
+        assert_eq!(state.input_text(), "-12.5");
+        assert!((state.value() + 12.5).abs() < 1e-9);
+
+        if let Some(action) = keystroke_to_action(&named("backspace")) {
+            state.apply_action(action);
+        }
+        assert_eq!(state.input_text(), "-12.");
+
+        if let Some(action) = keystroke_to_action(&named("escape")) {
+            state.apply_action(action);
+        }
+        assert_eq!(state.input_text(), "0");
+    }
 }

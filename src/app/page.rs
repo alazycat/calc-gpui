@@ -2,7 +2,8 @@
 //!
 //! 页面只有两种：计算器模式（各自独立的状态），和换算器（13 个分类共用一份状态）。
 //! 换算器的分类不是页面自己的枚举，而是 [`ConverterKind`]——页面只是「当前是哪个
-//! 分类」的持有者，名字、图标、存档标识都由分类自己回答。
+//! 分类」的持有者；名字与存档标识由分类自己回答，图标是展示层的事，
+//! 统一在下面的 `icon()` 里映射（换算器分类的图标也在那里）。
 //!
 //! 这里只有「有哪些页面」和「页面怎么描述自己」，不含任何状态。
 
@@ -70,7 +71,7 @@ impl Page {
             Page::Graphing => IconName::ChartLine,
             Page::Programmer => IconName::Binary,
             Page::DateCalculation => IconName::CalendarClock,
-            Page::Converter(kind) => kind.icon(),
+            Page::Converter(kind) => converter_icon(kind),
         }
     }
 
@@ -95,7 +96,7 @@ impl Page {
             .iter()
             .copied()
             .find(|page| page.as_str() == value)
-            .or_else(|| ConverterKind::from_str(value).map(Page::Converter))
+            .or_else(|| value.parse::<ConverterKind>().ok().map(Page::Converter))
             .unwrap_or(Page::Standard)
     }
 
@@ -105,5 +106,27 @@ impl Page {
             Page::Converter(kind) => Some(kind),
             _ => None,
         }
+    }
+}
+
+/// 换算器分类在菜单里的图标。
+///
+/// 图标是展示层的事，所以放在这里而不是换算器的状态表里；
+/// match 对 [`ConverterKind`] 穷举，新增分类时漏写图标会编译报错。
+fn converter_icon(kind: ConverterKind) -> IconName {
+    match kind {
+        ConverterKind::Currency => IconName::Banknote,
+        ConverterKind::Volume => IconName::Container,
+        ConverterKind::Length => IconName::Ruler,
+        ConverterKind::Weight => IconName::Weight,
+        ConverterKind::Temperature => IconName::Thermometer,
+        ConverterKind::Energy => IconName::Flame,
+        ConverterKind::Area => IconName::LandPlot,
+        ConverterKind::Speed => IconName::Gauge,
+        ConverterKind::Time => IconName::Clock,
+        ConverterKind::Power => IconName::Zap,
+        ConverterKind::Data => IconName::Database,
+        ConverterKind::Pressure => IconName::CircleGauge,
+        ConverterKind::Angle => IconName::Compass,
     }
 }

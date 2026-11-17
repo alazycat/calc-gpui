@@ -10,4 +10,4 @@ mod state;
 mod view;
 
 pub use state::*;
-pub use view::render;
+pub use view::{keystroke_to_action, render};

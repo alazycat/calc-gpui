@@ -74,7 +74,9 @@ impl PageView for StandardCalc {
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke) {
-        StandardCalc::handle_key(self, keystroke);
+        if let Some(action) = standard::keystroke_to_action(keystroke) {
+            self.apply_action(action);
+        }
     }
 
     fn copy_text(&self) -> String {
@@ -100,7 +102,9 @@ impl PageView for ScientificCalc {
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke) {
-        ScientificCalc::handle_key(self, keystroke);
+        if let Some(action) = scientific::keystroke_to_action(keystroke) {
+            self.apply_action(action);
+        }
     }
 
     fn copy_text(&self) -> String {
@@ -126,7 +130,9 @@ impl PageView for ProgrammerCalc {
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke) {
-        ProgrammerCalc::handle_key(self, keystroke);
+        if let Some(action) = programmer::keystroke_to_action(keystroke) {
+            self.apply_action(action);
+        }
     }
 
     fn copy_text(&self) -> String {
@@ -144,7 +150,9 @@ impl PageView for GraphState {
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke) {
-        GraphState::handle_key(self, keystroke);
+        if let Some(action) = graph::keystroke_to_action(keystroke) {
+            self.apply_action(action);
+        }
     }
 
     fn copy_text(&self) -> String {
@@ -162,7 +170,9 @@ impl PageView for ConverterState {
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke) {
-        ConverterState::handle_key(self, keystroke);
+        if let Some(action) = converter::keystroke_to_action(keystroke) {
+            self.apply_action(action);
+        }
     }
 
     fn copy_text(&self) -> String {

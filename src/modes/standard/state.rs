@@ -1,9 +1,9 @@
 //! 标准模式的状态机：token、运算符语义、求值，以及历史与记忆。
 
 use crate::shared::eval::{self, Assoc, CalcError, Language, Operator};
+use crate::shared::history;
 use crate::shared::memory::Memory;
 use crate::shared::number::format_plain;
-use gpui_kit::Keystroke;
 
 /// 四则运算的运算符。
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -120,13 +120,38 @@ pub fn evaluate(tokens: &[Token]) -> Result<f64, CalcError> {
     eval::evaluate(StandardLanguage, tokens)
 }
 
-/// 一条计算历史。
-#[derive(Clone)]
-pub struct HistoryEntry {
-    /// 带等号的算式，例如 `2 + 3 × 4 =`。
-    pub expression: String,
-    /// 计算结果。
-    pub result: String,
+pub use crate::shared::history::HistoryEntry;
+
+/// 标准模式能理解的用户输入意图。
+///
+/// 用纯数据描述按键语义，让 [`StandardCalc`] 不依赖任何 UI 类型；
+/// 具体的 `Keystroke` → [`Action`] 转换在 [`crate::modes::standard::view`] 里完成。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Action {
+    /// 输入一个数字字符（'0'..='9'）。
+    Digit(char),
+    /// 小数点。
+    Dot,
+    /// 四则运算符。
+    Operator(Op),
+    /// 等号 / 回车。
+    Equals,
+    /// 清空（C / Esc / Delete）。
+    Clear,
+    /// 清除当前输入（CE）。
+    ClearEntry,
+    /// 退格删除一位。
+    Backspace,
+    /// 正负号切换。
+    Negate,
+    /// 百分比。
+    Percent,
+    /// 倒数 1/x。
+    Reciprocal,
+    /// 平方 x²。
+    Square,
+    /// 平方根 √x。
+    Sqrt,
 }
 
 /// 「标准」模式的状态。
@@ -346,14 +371,13 @@ impl StandardCalc {
         if !has_operator {
             return;
         }
-        self.history.push(HistoryEntry {
-            expression: self.expression.clone(),
-            result: self.display.clone(),
-        });
-        // 最多保留 50 条，避免无限增长。
-        if self.history.len() > 50 {
-            self.history.remove(0);
-        }
+        history::push(
+            &mut self.history,
+            HistoryEntry {
+                expression: self.expression.clone(),
+                result: self.display.clone(),
+            },
+        );
     }
 
     /// 点击历史条目：把结果回填到显示区，并关闭历史面板。
@@ -528,38 +552,24 @@ impl StandardCalc {
         }
     }
 
-    /// 处理一次按键。
-    pub fn handle_key(&mut self, keystroke: &Keystroke) {
-        // 带 Ctrl / Alt / Cmd 的组合键交给系统处理，不当作计算器输入。
-        let modifiers = &keystroke.modifiers;
-        if modifiers.control || modifiers.alt || modifiers.platform {
-            return;
-        }
-
-        // 优先使用能直接打出来的字符，这样能正确处理 Shift 出来的 +、* 等。
-        let typed = keystroke.key_char.as_deref().unwrap_or("");
-        let mut iter = typed.chars();
-        if let (Some(c), None) = (iter.next(), iter.next()) {
-            match c {
-                '0'..='9' => self.input_digit(c),
-                '.' => self.input_dot(),
-                '+' => self.set_operator(Op::Add),
-                '-' => self.set_operator(Op::Sub),
-                '*' | 'x' | 'X' => self.set_operator(Op::Mul),
-                '/' => self.set_operator(Op::Div),
-                '%' => self.percent(),
-                '=' => self.equals(),
-                _ => {}
-            }
-            return;
-        }
-
-        // 没有对应字符的功能键。
-        match keystroke.key.as_str() {
-            "enter" => self.equals(),
-            "escape" | "delete" => self.clear(),
-            "backspace" => self.backspace(),
-            _ => {}
+    /// 执行一个语义动作。
+    ///
+    /// 所有键盘 / 按钮输入最终都通过这里驱动状态机；状态机本身不认识任何 UI 类型，
+    /// 按键到 [`Action`] 的翻译由 UI 层负责。
+    pub fn apply_action(&mut self, action: Action) {
+        match action {
+            Action::Digit(d) => self.input_digit(d),
+            Action::Dot => self.input_dot(),
+            Action::Operator(op) => self.set_operator(op),
+            Action::Equals => self.equals(),
+            Action::Clear => self.clear(),
+            Action::ClearEntry => self.clear_entry(),
+            Action::Backspace => self.backspace(),
+            Action::Negate => self.negate(),
+            Action::Percent => self.percent(),
+            Action::Reciprocal => self.reciprocal(),
+            Action::Square => self.square(),
+            Action::Sqrt => self.sqrt(),
         }
     }
 
@@ -582,13 +592,18 @@ impl StandardCalc {
     }
 }
 
+impl Default for StandardCalc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // 注意：这里不能写 `use super::*;`，因为 `gpui_kit::*` 导出的 `test`
     // 宏会遮蔽内置的 `#[test]`，导致递归展开报错。
-    use super::{CalcError, Op, StandardCalc, Token, evaluate};
+    use super::{Action, CalcError, Op, StandardCalc, Token, evaluate};
     use crate::shared::number::format_plain;
-    use gpui_kit::{Keystroke, Modifiers};
 
     /// 方便在测试里构造 token。
     fn num(value: impl ToString) -> Token {
@@ -923,54 +938,58 @@ mod tests {
         assert!(calc.history.is_empty());
     }
 
-    // ---- 键盘输入 ----
+    // ---- 动作分发 ----
 
-    /// 构造一个只带 `key` 与 `key_char` 的按键事件。
-    fn key(key: &str, key_char: Option<&str>) -> Keystroke {
-        Keystroke {
-            modifiers: Modifiers::default(),
-            key: key.to_string(),
-            key_char: key_char.map(|s| s.to_string()),
-        }
-    }
-
+    /// [`Action`] 必须能正确路由到对应的语义方法。
     #[test]
-    fn keyboard_typing_respects_precedence() {
+    fn apply_action_dispatches_to_semantic_methods() {
         let mut calc = StandardCalc::new();
-        // 依次敲 1 + 2 * 3，然后回车
-        for k in ["1", "+", "2", "*", "3"] {
-            calc.handle_key(&key(k, Some(k)));
-        }
-        calc.handle_key(&key("enter", None));
-        assert_eq!(calc.display, "7");
-    }
 
-    #[test]
-    fn keyboard_escape_clears() {
-        let mut calc = StandardCalc::new();
-        calc.handle_key(&key("5", Some("5")));
+        calc.apply_action(Action::Digit('2'));
+        assert_eq!(calc.display, "2");
+
+        calc.apply_action(Action::Operator(Op::Add));
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::Equals);
         assert_eq!(calc.display, "5");
-        calc.handle_key(&key("escape", None));
+
+        calc.apply_action(Action::Clear);
         assert_eq!(calc.display, "0");
         assert!(calc.expression.is_empty());
+
+        // 一元动作也走同一条分发路径。
+        calc.apply_action(Action::Digit('4'));
+        calc.apply_action(Action::Square);
+        assert_eq!(calc.display, "16");
+        calc.apply_action(Action::Sqrt);
+        assert_eq!(calc.display, "4");
+        calc.apply_action(Action::Reciprocal);
+        assert_eq!(calc.display, "0.25");
+        calc.apply_action(Action::Negate);
+        assert_eq!(calc.display, "-0.25");
+        calc.apply_action(Action::Percent);
+        assert_eq!(calc.display, "-0.0025");
     }
 
     #[test]
-    fn keyboard_trailing_operator_reuses_operand() {
+    fn apply_action_clear_entry_preserves_expression() {
         let mut calc = StandardCalc::new();
-        calc.handle_key(&key("7", Some("7")));
-        calc.handle_key(&key("+", Some("+")));
-        calc.handle_key(&key("enter", None));
-        // 末尾运算符悬空，复用最后一个数字：7 + 7 = 14
-        assert_eq!(calc.display, "14");
-    }
-
-    #[test]
-    fn keyboard_ignores_ctrl_combos() {
-        let mut calc = StandardCalc::new();
-        let mut keystroke = key("5", Some("5"));
-        keystroke.modifiers.control = true;
-        calc.handle_key(&keystroke);
+        calc.apply_action(Action::Digit('1'));
+        calc.apply_action(Action::Operator(Op::Add));
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::ClearEntry);
         assert_eq!(calc.display, "0");
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::Equals);
+        assert_eq!(calc.display, "4");
+    }
+
+    #[test]
+    fn apply_action_backspace_removes_digit() {
+        let mut calc = StandardCalc::new();
+        calc.apply_action(Action::Digit('1'));
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::Backspace);
+        assert_eq!(calc.display, "1");
     }
 }

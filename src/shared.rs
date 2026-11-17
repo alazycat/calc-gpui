@@ -4,6 +4,7 @@
 //! 是单向的：模式/工具 → 共享内核，反过来不成立。
 
 pub mod eval;
+pub mod history;
 pub mod memory;
 pub mod number;
 pub mod storage;

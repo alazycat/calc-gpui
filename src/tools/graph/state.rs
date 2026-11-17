@@ -1,7 +1,22 @@
 //! 绘图状态：表达式输入、光标位置、最近一次成功的曲线与视口范围。
 
 use super::expr::{Expr, parse};
-use gpui_kit::Keystroke;
+
+/// 绘图输入框可执行的语义动作（由 UI 层从按键翻译而来）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Action {
+    /// 输入一个字符（表达式是文本，任意可见字符都交给 [`GraphState::input_char`] 过滤）。
+    Input(char),
+    Backspace,
+    DeleteForward,
+    /// 光标移动 `i32` 格，负数向左、正数向右。
+    MoveCursor(i32),
+    Home,
+    End,
+    /// 解析并绘制（按 Enter / 绘图按钮）。
+    Plot,
+    Clear,
+}
 
 /// 绘图模式状态。
 pub struct GraphState {
@@ -176,29 +191,17 @@ impl GraphState {
         }
     }
 
-    pub fn handle_key(&mut self, keystroke: &Keystroke) {
-        let modifiers = &keystroke.modifiers;
-        if modifiers.control || modifiers.alt || modifiers.platform {
-            return;
-        }
-
-        let typed = keystroke.key_char.as_deref().unwrap_or("");
-        let mut iter = typed.chars();
-        if let (Some(c), None) = (iter.next(), iter.next()) {
-            self.input_char(c);
-            return;
-        }
-
-        match keystroke.key.as_str() {
-            "backspace" => self.backspace(),
-            "delete" => self.delete_forward(),
-            "left" => self.move_cursor(-1),
-            "right" => self.move_cursor(1),
-            "home" => self.move_home(),
-            "end" => self.move_end(),
-            "enter" => self.plot(),
-            "escape" => self.clear(),
-            _ => {}
+    /// 分发一个语义动作；按键到动作的翻译见 [`crate::tools::graph::keystroke_to_action`]。
+    pub fn apply_action(&mut self, action: Action) {
+        match action {
+            Action::Input(ch) => self.input_char(ch),
+            Action::Backspace => self.backspace(),
+            Action::DeleteForward => self.delete_forward(),
+            Action::MoveCursor(delta) => self.move_cursor(delta),
+            Action::Home => self.move_home(),
+            Action::End => self.move_end(),
+            Action::Plot => self.plot(),
+            Action::Clear => self.clear(),
         }
     }
 }
@@ -206,5 +209,56 @@ impl GraphState {
 impl Default for GraphState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, GraphState};
+
+    #[test]
+    fn apply_action_dispatches_text_editing() {
+        let mut state = GraphState::new();
+        state.clear();
+        for ch in "2x".chars() {
+            state.apply_action(Action::Input(ch));
+        }
+        assert_eq!(state.copy_text(), "2x");
+        assert_eq!(state.cursor, 2);
+
+        state.apply_action(Action::Backspace);
+        assert_eq!(state.copy_text(), "2");
+
+        state.apply_action(Action::Home);
+        state.apply_action(Action::Input('9'));
+        assert_eq!(state.copy_text(), "92");
+
+        // 光标停在 '9' 与 '2' 之间，向前删除 '2'。
+        state.apply_action(Action::DeleteForward);
+        assert_eq!(state.copy_text(), "9");
+    }
+
+    #[test]
+    fn apply_action_end_plot_and_clear() {
+        let mut state = GraphState::new();
+        state.clear();
+
+        // 在空输入上绘图应报告解析错误。
+        state.apply_action(Action::Plot);
+        assert!(state.error().is_some());
+        assert!(state.plotted.is_none());
+
+        state.apply_action(Action::Input('x'));
+        state.apply_action(Action::End);
+        assert_eq!(state.cursor, 1);
+
+        state.apply_action(Action::Plot);
+        assert!(state.error().is_none());
+        assert!(state.plotted.is_some());
+
+        state.apply_action(Action::Clear);
+        assert_eq!(state.copy_text(), "");
+        assert_eq!(state.cursor, 0);
+        assert!(state.plotted.is_none());
     }
 }

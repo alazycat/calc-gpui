@@ -1,12 +1,51 @@
 //! 标准模式的界面：显示屏、记忆行、键盘、历史面板与记忆面板。
 
-use super::{Op, StandardCalc};
+use super::{Action, Op, StandardCalc};
 use crate::app::CalcApp;
 use crate::shared::number::format_plain;
 use crate::shared::ui::{self, Palette};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable, StyledExt};
 use gpui_kit::*;
+
+/// 把一次按键翻译成标准模式的语义动作。
+///
+/// 返回 `None` 表示该按键不归计算器处理（组合键、未知键等）。
+/// 这是 UI 层唯一认识 [`gpui_kit::Keystroke`] 的地方；[`StandardCalc`]
+/// 只消费纯数据 [`Action`]。
+pub fn keystroke_to_action(keystroke: &Keystroke) -> Option<Action> {
+    // 带 Ctrl / Alt / Cmd 的组合键交给系统处理，不当作计算器输入。
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform {
+        return None;
+    }
+
+    // 优先使用能直接打出来的字符，这样能正确处理 Shift 出来的 +、* 等。
+    let typed = keystroke.key_char.as_deref().unwrap_or("");
+    let mut iter = typed.chars();
+    if let (Some(c), None) = (iter.next(), iter.next()) {
+        let action = match c {
+            '0'..='9' => Action::Digit(c),
+            '.' => Action::Dot,
+            '+' => Action::Operator(Op::Add),
+            '-' => Action::Operator(Op::Sub),
+            '*' | 'x' | 'X' => Action::Operator(Op::Mul),
+            '/' => Action::Operator(Op::Div),
+            '%' => Action::Percent,
+            '=' => Action::Equals,
+            _ => return None,
+        };
+        return Some(action);
+    }
+
+    // 没有对应字符的功能键。
+    match keystroke.key.as_str() {
+        "enter" => Some(Action::Equals),
+        "escape" | "delete" => Some(Action::Clear),
+        "backspace" => Some(Action::Backspace),
+        _ => None,
+    }
+}
 
 /// 绘制「标准」模式的主体（显示屏 + 记忆行 + 按键区）。
 pub fn render(state: &StandardCalc, cx: &mut Context<CalcApp>) -> AnyElement {
@@ -322,4 +361,152 @@ fn render_memory(state: &StandardCalc, cx: &mut Context<CalcApp>, p: Palette) ->
         |index, app| app.standard.memory_recall_at(index),
         |app| app.standard.memory_clear(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, Op, StandardCalc, keystroke_to_action};
+    use gpui_kit::{Keystroke, Modifiers};
+
+    /// 构造一个只带 `key` 与 `key_char` 的按键事件。
+    fn key(key: &str, key_char: Option<&str>) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: key.to_string(),
+            key_char: key_char.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn digits_map_to_digit_action() {
+        for c in '0'..='9' {
+            let s = c.to_string();
+            assert_eq!(
+                keystroke_to_action(&key(&s, Some(&s))),
+                Some(Action::Digit(c)),
+                "数字 {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn operators_map_correctly() {
+        assert_eq!(
+            keystroke_to_action(&key("+", Some("+"))),
+            Some(Action::Operator(Op::Add))
+        );
+        assert_eq!(
+            keystroke_to_action(&key("-", Some("-"))),
+            Some(Action::Operator(Op::Sub))
+        );
+        // Shift+8 打出 *，以及 x / X 都当乘号。
+        assert_eq!(
+            keystroke_to_action(&key("*", Some("*"))),
+            Some(Action::Operator(Op::Mul))
+        );
+        assert_eq!(
+            keystroke_to_action(&key("x", Some("x"))),
+            Some(Action::Operator(Op::Mul))
+        );
+        assert_eq!(
+            keystroke_to_action(&key("/", Some("/"))),
+            Some(Action::Operator(Op::Div))
+        );
+    }
+
+    #[test]
+    fn dot_percent_and_equals_map_correctly() {
+        assert_eq!(keystroke_to_action(&key(".", Some("."))), Some(Action::Dot));
+        assert_eq!(
+            keystroke_to_action(&key("%", Some("%"))),
+            Some(Action::Percent)
+        );
+        assert_eq!(
+            keystroke_to_action(&key("=", Some("="))),
+            Some(Action::Equals)
+        );
+    }
+
+    #[test]
+    fn function_keys_map_correctly() {
+        assert_eq!(
+            keystroke_to_action(&key("enter", None)),
+            Some(Action::Equals)
+        );
+        assert_eq!(
+            keystroke_to_action(&key("escape", None)),
+            Some(Action::Clear)
+        );
+        assert_eq!(
+            keystroke_to_action(&key("delete", None)),
+            Some(Action::Clear)
+        );
+        assert_eq!(
+            keystroke_to_action(&key("backspace", None)),
+            Some(Action::Backspace)
+        );
+    }
+
+    #[test]
+    fn unknown_keys_return_none() {
+        assert_eq!(keystroke_to_action(&key("a", Some("a"))), None);
+        assert_eq!(keystroke_to_action(&key("f1", None)), None);
+    }
+
+    #[test]
+    fn modifier_combos_are_ignored() {
+        let mut keystroke = key("5", Some("5"));
+        keystroke.modifiers.control = true;
+        assert_eq!(keystroke_to_action(&keystroke), None);
+
+        let mut keystroke = key("5", Some("5"));
+        keystroke.modifiers.alt = true;
+        assert_eq!(keystroke_to_action(&keystroke), None);
+    }
+
+    // ---- 端到端：适配器 + 状态机 ----
+
+    #[test]
+    fn typing_respects_precedence() {
+        let mut calc = StandardCalc::new();
+        // 依次敲 1 + 2 * 3，然后回车
+        for k in ["1", "+", "2", "*", "3"] {
+            if let Some(action) = keystroke_to_action(&key(k, Some(k))) {
+                calc.apply_action(action);
+            }
+        }
+        if let Some(action) = keystroke_to_action(&key("enter", None)) {
+            calc.apply_action(action);
+        }
+        assert_eq!(calc.display, "7");
+    }
+
+    #[test]
+    fn escape_clears_state() {
+        let mut calc = StandardCalc::new();
+        if let Some(action) = keystroke_to_action(&key("5", Some("5"))) {
+            calc.apply_action(action);
+        }
+        assert_eq!(calc.display, "5");
+        if let Some(action) = keystroke_to_action(&key("escape", None)) {
+            calc.apply_action(action);
+        }
+        assert_eq!(calc.display, "0");
+        assert!(calc.expression.is_empty());
+    }
+
+    #[test]
+    fn trailing_operator_reuses_operand() {
+        let mut calc = StandardCalc::new();
+        for k in ["7", "+"] {
+            if let Some(action) = keystroke_to_action(&key(k, Some(k))) {
+                calc.apply_action(action);
+            }
+        }
+        if let Some(action) = keystroke_to_action(&key("enter", None)) {
+            calc.apply_action(action);
+        }
+        // 末尾运算符悬空，复用最后一个数字：7 + 7 = 14
+        assert_eq!(calc.display, "14");
+    }
 }

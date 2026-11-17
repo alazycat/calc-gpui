@@ -3,15 +3,52 @@
 use super::expr::{SToken, evaluate, paren_depth, tokens_to_string};
 use super::ops::{AngleMode, Constant, MathFn, SOp, Trig, Unary};
 use crate::shared::eval::{CalcError, Operator};
+use crate::shared::history;
 use crate::shared::memory::Memory;
 use crate::shared::number::format_value;
-use gpui_kit::Keystroke;
 
-/// 一条计算历史。
-#[derive(Clone)]
-pub struct HistoryEntry {
-    pub expression: String,
-    pub result: String,
+pub use crate::shared::history::HistoryEntry;
+
+/// 科学模式能理解的用户输入意图。
+///
+/// 用纯数据描述按键语义，让 [`ScientificCalc`] 不依赖任何 UI 类型；
+/// 具体的 `Keystroke` → [`Action`] 转换在 [`crate::modes::scientific::view`] 里完成。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Action {
+    /// 输入一个数字字符（'0'..='9'）。
+    Digit(char),
+    /// 小数点。
+    Dot,
+    /// 二元运算符。
+    Operator(SOp),
+    /// 左括号。
+    OpenParen,
+    /// 右括号。
+    CloseParen,
+    /// 等号 / 回车。
+    Equals,
+    /// 全部清除（C / Esc）。
+    Clear,
+    /// 清除当前输入（CE / Delete）。
+    ClearEntry,
+    /// 退格删除一位。
+    Backspace,
+    /// 正负号切换。
+    Negate,
+    /// 输入常量（π / e）。
+    PressConst(Constant),
+    /// 一元函数（x²、√x、n! 等）。
+    ApplyUnary(Unary),
+    /// 三角函数。
+    ApplyTrig(Trig),
+    /// 其他数学函数（双曲、取整等）。
+    ApplyMath(MathFn),
+    /// 切换 2nd 功能键。
+    ToggleSecond,
+    /// 切换 F-E 科学计数法显示。
+    ToggleScientificNotation,
+    /// 角度制在 DEG / RAD / GRAD 间循环。
+    CycleAngle,
 }
 
 /// 「科学」模式的状态。
@@ -410,13 +447,11 @@ impl ScientificCalc {
         self.waiting_for_operand = true;
 
         if has_operator && self.error.is_none() {
-            self.history.push(HistoryEntry {
+            let entry = HistoryEntry {
                 expression: self.expression.clone(),
                 result: self.display(),
-            });
-            if self.history.len() > 50 {
-                self.history.remove(0);
-            }
+            };
+            history::push(&mut self.history, entry);
         }
     }
 
@@ -489,40 +524,31 @@ impl ScientificCalc {
         self.waiting_for_operand = true;
     }
 
-    // ---- 键盘 ----
+    // ---- 输入动作 ----
 
-    pub fn handle_key(&mut self, keystroke: &Keystroke) {
-        let modifiers = &keystroke.modifiers;
-        if modifiers.control || modifiers.alt || modifiers.platform {
-            return;
-        }
-
-        let typed = keystroke.key_char.as_deref().unwrap_or("");
-        let mut iter = typed.chars();
-        if let (Some(c), None) = (iter.next(), iter.next()) {
-            match c {
-                '0'..='9' => self.input_digit(c),
-                '.' => self.input_dot(),
-                '+' => self.set_operator(SOp::Add),
-                '-' => self.set_operator(SOp::Sub),
-                '*' | 'x' | 'X' => self.set_operator(SOp::Mul),
-                '/' => self.set_operator(SOp::Div),
-                '%' => self.set_operator(SOp::Mod),
-                '^' => self.set_operator(SOp::Pow),
-                '(' => self.open_paren(),
-                ')' => self.close_paren(),
-                '=' => self.equals(),
-                _ => {}
-            }
-            return;
-        }
-
-        match keystroke.key.as_str() {
-            "enter" => self.equals(),
-            "escape" => self.clear(),
-            "delete" => self.clear_entry(),
-            "backspace" => self.backspace(),
-            _ => {}
+    /// 执行一个语义动作。
+    ///
+    /// 所有键盘 / 按钮输入最终都通过这里驱动状态机；状态机本身不认识任何 UI 类型，
+    /// 按键到 [`Action`] 的翻译由 UI 层负责。
+    pub fn apply_action(&mut self, action: Action) {
+        match action {
+            Action::Digit(d) => self.input_digit(d),
+            Action::Dot => self.input_dot(),
+            Action::Operator(op) => self.set_operator(op),
+            Action::OpenParen => self.open_paren(),
+            Action::CloseParen => self.close_paren(),
+            Action::Equals => self.equals(),
+            Action::Clear => self.clear(),
+            Action::ClearEntry => self.clear_entry(),
+            Action::Backspace => self.backspace(),
+            Action::Negate => self.negate(),
+            Action::PressConst(constant) => self.press_const(constant),
+            Action::ApplyUnary(unary) => self.apply_unary(unary),
+            Action::ApplyTrig(trig) => self.apply_trig(trig),
+            Action::ApplyMath(function) => self.apply_math(function),
+            Action::ToggleSecond => self.toggle_second(),
+            Action::ToggleScientificNotation => self.toggle_scientific_notation(),
+            Action::CycleAngle => self.cycle_angle(),
         }
     }
 
@@ -554,11 +580,10 @@ impl Default for ScientificCalc {
 #[cfg(test)]
 mod tests {
     use super::{
-        AngleMode, CalcError, Constant, MathFn, SOp, SToken, ScientificCalc, Trig, Unary, evaluate,
-        format_value,
+        Action, AngleMode, CalcError, Constant, MathFn, SOp, SToken, ScientificCalc, Trig, Unary,
+        evaluate, format_value,
     };
     use crate::shared::number::format_plain;
-    use gpui_kit::{Keystroke, Modifiers};
 
     fn num(value: f64) -> SToken {
         SToken::Num(value)
@@ -795,19 +820,89 @@ mod tests {
         assert_eq!(calc.history[0].result, "4");
     }
 
-    #[test]
-    fn keyboard_typing() {
-        let key = |key: &str, key_char: Option<&str>| Keystroke {
-            modifiers: Modifiers::default(),
-            key: key.to_string(),
-            key_char: key_char.map(|s| s.to_string()),
-        };
+    // ---- 动作分发 ----
 
+    /// [`Action`] 必须能正确路由到对应的语义方法。
+    #[test]
+    fn apply_action_dispatches_to_semantic_methods() {
         let mut calc = ScientificCalc::new();
-        for k in ["2", "+", "3", "*", "4"] {
-            calc.handle_key(&key(k, Some(k)));
-        }
-        calc.handle_key(&key("enter", None));
+
+        // 2 + 3 * 4 = 14
+        calc.apply_action(Action::Digit('2'));
+        assert_eq!(calc.display(), "2");
+        calc.apply_action(Action::Operator(SOp::Add));
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::Operator(SOp::Mul));
+        calc.apply_action(Action::Digit('4'));
+        calc.apply_action(Action::Equals);
         assert_eq!(calc.display(), "14");
+
+        calc.apply_action(Action::Clear);
+        assert_eq!(calc.display(), "0");
+        assert!(calc.expression().is_empty());
+
+        // 括号与幂：(2 + 3) ^ 2 = 25
+        calc.apply_action(Action::OpenParen);
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::Operator(SOp::Add));
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::CloseParen);
+        calc.apply_action(Action::Operator(SOp::Pow));
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::Equals);
+        assert_eq!(calc.display(), "25");
+    }
+
+    #[test]
+    fn apply_action_unary_and_constants() {
+        let mut calc = ScientificCalc::new();
+
+        // π * 2
+        calc.apply_action(Action::PressConst(Constant::Pi));
+        assert_eq!(calc.display(), "π");
+        calc.apply_action(Action::Operator(SOp::Mul));
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::Equals);
+        assert_eq!(calc.display(), "6.2831853071796");
+
+        // 一元函数：9 的平方根
+        calc.apply_action(Action::Clear);
+        calc.apply_action(Action::Digit('9'));
+        calc.apply_action(Action::ApplyUnary(Unary::Sqrt));
+        assert_eq!(calc.display(), "3");
+
+        // 三角函数（DEG 模式）：sin(30)
+        calc.apply_action(Action::Clear);
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::Digit('0'));
+        calc.apply_action(Action::ApplyTrig(Trig::Sin));
+        assert_eq!(calc.display(), "0.5");
+    }
+
+    #[test]
+    fn apply_action_toggles() {
+        let mut calc = ScientificCalc::new();
+
+        calc.apply_action(Action::CycleAngle);
+        assert_eq!(calc.angle, AngleMode::Rad);
+
+        calc.apply_action(Action::ToggleSecond);
+        assert!(calc.second);
+
+        calc.apply_action(Action::ToggleScientificNotation);
+        assert!(calc.scientific_notation);
+    }
+
+    #[test]
+    fn apply_action_clear_entry_preserves_expression() {
+        let mut calc = ScientificCalc::new();
+        calc.apply_action(Action::Digit('1'));
+        calc.apply_action(Action::Operator(SOp::Add));
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::ClearEntry);
+        assert_eq!(calc.display(), "0");
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::Equals);
+        assert_eq!(calc.display(), "4");
     }
 }

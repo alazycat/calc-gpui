@@ -1,6 +1,6 @@
 //! 科学模式的界面：显示屏、状态行、函数下拉、键盘、历史与记忆面板。
 
-use super::{Constant, MathFn, SOp, ScientificCalc, Trig, Unary};
+use super::{Action, Constant, MathFn, SOp, ScientificCalc, Trig, Unary};
 use crate::app::CalcApp;
 use crate::shared::number::format_value;
 use crate::shared::ui::{self, Palette};
@@ -9,6 +9,46 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{Icon, Sizable, StyledExt};
 use gpui_kit::*;
+
+/// 把一次按键翻译成科学模式的语义动作。
+///
+/// 返回 `None` 表示该按键不归计算器处理（组合键、未知键等）。
+/// 这是 UI 层唯一认识 [`gpui_kit::Keystroke`] 的地方；[`ScientificCalc`]
+/// 只消费纯数据 [`Action`]。
+pub fn keystroke_to_action(keystroke: &Keystroke) -> Option<Action> {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform {
+        return None;
+    }
+
+    let typed = keystroke.key_char.as_deref().unwrap_or("");
+    let mut iter = typed.chars();
+    if let (Some(c), None) = (iter.next(), iter.next()) {
+        let action = match c {
+            '0'..='9' => Action::Digit(c),
+            '.' => Action::Dot,
+            '+' => Action::Operator(SOp::Add),
+            '-' => Action::Operator(SOp::Sub),
+            '*' | 'x' | 'X' => Action::Operator(SOp::Mul),
+            '/' => Action::Operator(SOp::Div),
+            '%' => Action::Operator(SOp::Mod),
+            '^' => Action::Operator(SOp::Pow),
+            '(' => Action::OpenParen,
+            ')' => Action::CloseParen,
+            '=' => Action::Equals,
+            _ => return None,
+        };
+        return Some(action);
+    }
+
+    match keystroke.key.as_str() {
+        "enter" => Some(Action::Equals),
+        "escape" => Some(Action::Clear),
+        "delete" => Some(Action::ClearEntry),
+        "backspace" => Some(Action::Backspace),
+        _ => None,
+    }
+}
 
 /// 「三角函数」下拉的菜单项。
 fn trig_items(second: bool) -> Vec<(Trig, &'static str)> {
@@ -574,4 +614,173 @@ fn render_memory(state: &ScientificCalc, cx: &mut Context<CalcApp>, p: Palette) 
         |index, app| app.scientific.memory_recall_at(index),
         |app| app.scientific.memory_clear(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, SOp, ScientificCalc, keystroke_to_action};
+    use gpui_kit::{Keystroke, Modifiers};
+
+    fn key(key: &str, key_char: Option<&str>) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: key.to_string(),
+            key_char: key_char.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn digits_map_to_digit_action() {
+        for c in '0'..='9' {
+            let s = c.to_string();
+            assert_eq!(
+                keystroke_to_action(&key(&s, Some(&s))),
+                Some(Action::Digit(c)),
+                "数字 {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn operators_map_correctly() {
+        assert_eq!(
+            keystroke_to_action(&key("+", Some("+"))),
+            Some(Action::Operator(SOp::Add))
+        );
+        assert_eq!(
+            keystroke_to_action(&key("-", Some("-"))),
+            Some(Action::Operator(SOp::Sub))
+        );
+        assert_eq!(
+            keystroke_to_action(&key("*", Some("*"))),
+            Some(Action::Operator(SOp::Mul))
+        );
+        assert_eq!(
+            keystroke_to_action(&key("/", Some("/"))),
+            Some(Action::Operator(SOp::Div))
+        );
+        // 科学模式：% 是取模，^ 是幂。
+        assert_eq!(
+            keystroke_to_action(&key("%", Some("%"))),
+            Some(Action::Operator(SOp::Mod))
+        );
+        assert_eq!(
+            keystroke_to_action(&key("^", Some("^"))),
+            Some(Action::Operator(SOp::Pow))
+        );
+    }
+
+    #[test]
+    fn parentheses_and_dot_map_correctly() {
+        assert_eq!(
+            keystroke_to_action(&key("(", Some("("))),
+            Some(Action::OpenParen)
+        );
+        assert_eq!(
+            keystroke_to_action(&key(")", Some(")"))),
+            Some(Action::CloseParen)
+        );
+        assert_eq!(keystroke_to_action(&key(".", Some("."))), Some(Action::Dot));
+    }
+
+    #[test]
+    fn function_keys_map_correctly() {
+        assert_eq!(
+            keystroke_to_action(&key("=", Some("="))),
+            Some(Action::Equals)
+        );
+        assert_eq!(
+            keystroke_to_action(&key("enter", None)),
+            Some(Action::Equals)
+        );
+        // 科学模式：Esc 全部清除，Delete 清除当前输入。
+        assert_eq!(
+            keystroke_to_action(&key("escape", None)),
+            Some(Action::Clear)
+        );
+        assert_eq!(
+            keystroke_to_action(&key("delete", None)),
+            Some(Action::ClearEntry)
+        );
+        assert_eq!(
+            keystroke_to_action(&key("backspace", None)),
+            Some(Action::Backspace)
+        );
+    }
+
+    #[test]
+    fn unknown_keys_return_none() {
+        assert_eq!(keystroke_to_action(&key("a", Some("a"))), None);
+        assert_eq!(keystroke_to_action(&key("f1", None)), None);
+    }
+
+    #[test]
+    fn modifier_combos_are_ignored() {
+        let mut keystroke = key("5", Some("5"));
+        keystroke.modifiers.control = true;
+        assert_eq!(keystroke_to_action(&keystroke), None);
+
+        let mut keystroke = key("5", Some("5"));
+        keystroke.modifiers.alt = true;
+        assert_eq!(keystroke_to_action(&keystroke), None);
+    }
+
+    // ---- 端到端：适配器 + 状态机 ----
+
+    #[test]
+    fn typing_respects_precedence_and_parentheses() {
+        let mut calc = ScientificCalc::new();
+        // ( 2 + 3 ) * 4 = 20
+        for k in ["(", "2", "+", "3", ")", "*", "4"] {
+            if let Some(action) = keystroke_to_action(&key(k, Some(k))) {
+                calc.apply_action(action);
+            }
+        }
+        if let Some(action) = keystroke_to_action(&key("enter", None)) {
+            calc.apply_action(action);
+        }
+        assert_eq!(calc.display(), "20");
+    }
+
+    #[test]
+    fn escape_clears_and_delete_clears_entry() {
+        let mut calc = ScientificCalc::new();
+        if let Some(action) = keystroke_to_action(&key("1", Some("1"))) {
+            calc.apply_action(action);
+        }
+        if let Some(action) = keystroke_to_action(&key("+", Some("+"))) {
+            calc.apply_action(action);
+        }
+        if let Some(action) = keystroke_to_action(&key("2", Some("2"))) {
+            calc.apply_action(action);
+        }
+        // Delete 只清当前输入，保留算式。
+        if let Some(action) = keystroke_to_action(&key("delete", None)) {
+            calc.apply_action(action);
+        }
+        assert_eq!(calc.display(), "0");
+        assert_eq!(calc.expression(), "1 +");
+
+        // Esc 全部清除。
+        if let Some(action) = keystroke_to_action(&key("escape", None)) {
+            calc.apply_action(action);
+        }
+        assert_eq!(calc.display(), "0");
+        assert!(calc.expression().is_empty());
+    }
+
+    #[test]
+    fn percent_is_modulo() {
+        let mut calc = ScientificCalc::new();
+        // 7 % 3 = 1
+        for k in ["7", "%", "3"] {
+            if let Some(action) = keystroke_to_action(&key(k, Some(k))) {
+                calc.apply_action(action);
+            }
+        }
+        if let Some(action) = keystroke_to_action(&key("=", Some("="))) {
+            calc.apply_action(action);
+        }
+        assert_eq!(calc.display(), "1");
+    }
 }

@@ -2,7 +2,6 @@
 
 use crate::shared::eval::{self, Assoc, CalcError, Language, Operator};
 use crate::shared::memory::Memory;
-use gpui_kit::Keystroke;
 
 // ---------------------------------------------------------------------------
 // 进制 / 位宽 / 运算符
@@ -280,6 +279,40 @@ fn group_digits(digits: String, size: usize) -> String {
 // ---------------------------------------------------------------------------
 // 状态
 // ---------------------------------------------------------------------------
+
+/// 程序员模式能理解的用户输入意图。
+///
+/// 用纯数据描述按键语义，让 [`ProgrammerCalc`] 不依赖任何 UI 类型；
+/// 具体的 `Keystroke` → [`Action`] 转换在 [`crate::modes::programmer::view`] 里完成。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Action {
+    /// 输入一位数字（0–9 / A–F，按当前进制过滤）。
+    Digit(char),
+    /// 二元运算符。
+    Operator(BinOp),
+    /// 左括号。
+    OpenParen,
+    /// 右括号。
+    CloseParen,
+    /// 等号 / 回车。
+    Equals,
+    /// 全部清除（C / Esc）。
+    Clear,
+    /// 清除当前输入（CE / Delete）。
+    ClearEntry,
+    /// 退格删除一位。
+    Backspace,
+    /// 取相反数（补码）。
+    Negate,
+    /// 按位取反 NOT。
+    BitwiseNot,
+    /// 翻转某一位。
+    ToggleBit(u32),
+    /// 切换进制。
+    SetBase(Base),
+    /// 切换位宽。
+    SetWord(WordSize),
+}
 
 /// 「程序员」模式的状态。
 pub struct ProgrammerCalc {
@@ -643,45 +676,27 @@ impl ProgrammerCalc {
         self.waiting_for_operand = true;
     }
 
-    // ---- 键盘 ----
+    // ---- 输入动作 ----
 
-    pub fn handle_key(&mut self, keystroke: &Keystroke) {
-        let modifiers = &keystroke.modifiers;
-        if modifiers.control || modifiers.alt || modifiers.platform {
-            return;
-        }
-
-        let typed = keystroke.key_char.as_deref().unwrap_or("");
-        let mut iter = typed.chars();
-        if let (Some(c), None) = (iter.next(), iter.next()) {
-            match c {
-                '0'..='9' => self.input_digit(c),
-                'a'..='f' | 'A'..='F' => self.input_digit(c),
-                '+' => self.set_operator(BinOp::Add),
-                '-' => self.set_operator(BinOp::Sub),
-                '*' | 'x' | 'X' => self.set_operator(BinOp::Mul),
-                '/' => self.set_operator(BinOp::Div),
-                '%' => self.set_operator(BinOp::Mod),
-                '&' => self.set_operator(BinOp::And),
-                '|' => self.set_operator(BinOp::Or),
-                '^' => self.set_operator(BinOp::Xor),
-                '~' => self.bitwise_not(),
-                '(' => self.open_paren(),
-                ')' => self.close_paren(),
-                '<' => self.set_operator(BinOp::Lsh),
-                '>' => self.set_operator(BinOp::Rsh),
-                '=' => self.equals(),
-                _ => {}
-            }
-            return;
-        }
-
-        match keystroke.key.as_str() {
-            "enter" => self.equals(),
-            "escape" => self.clear(),
-            "delete" => self.clear_entry(),
-            "backspace" => self.backspace(),
-            _ => {}
+    /// 执行一个语义动作。
+    ///
+    /// 所有键盘 / 按钮输入最终都通过这里驱动状态机；状态机本身不认识任何 UI 类型，
+    /// 按键到 [`Action`] 的翻译由 UI 层负责。
+    pub fn apply_action(&mut self, action: Action) {
+        match action {
+            Action::Digit(ch) => self.input_digit(ch),
+            Action::Operator(op) => self.set_operator(op),
+            Action::OpenParen => self.open_paren(),
+            Action::CloseParen => self.close_paren(),
+            Action::Equals => self.equals(),
+            Action::Clear => self.clear(),
+            Action::ClearEntry => self.clear_entry(),
+            Action::Backspace => self.backspace(),
+            Action::Negate => self.negate(),
+            Action::BitwiseNot => self.bitwise_not(),
+            Action::ToggleBit(bit) => self.toggle_bit(bit),
+            Action::SetBase(base) => self.set_base(base),
+            Action::SetWord(word) => self.set_word(word),
         }
     }
 
@@ -713,10 +728,15 @@ impl ProgrammerCalc {
     }
 }
 
+impl Default for ProgrammerCalc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Base, BinOp, PToken, ProgrammerCalc, WordSize, evaluate, format_value};
-    use gpui_kit::{Keystroke, Modifiers};
+    use super::{Action, Base, BinOp, PToken, ProgrammerCalc, WordSize, evaluate, format_value};
 
     fn num(v: u64) -> PToken {
         PToken::Num(v)
@@ -724,14 +744,6 @@ mod tests {
 
     fn op(op: BinOp) -> PToken {
         PToken::Op(op)
-    }
-
-    fn key(key: &str, key_char: Option<&str>) -> Keystroke {
-        Keystroke {
-            modifiers: Modifiers::default(),
-            key: key.to_string(),
-            key_char: key_char.map(|s| s.to_string()),
-        }
     }
 
     #[test]
@@ -898,14 +910,82 @@ mod tests {
         assert_eq!(calc.display(), "12");
     }
 
+    // ---- 动作分发 ----
+
+    /// [`Action`] 必须能正确路由到对应的语义方法。
     #[test]
-    fn keyboard_accepts_hex_letters() {
+    fn apply_action_dispatches_to_semantic_methods() {
         let mut calc = ProgrammerCalc::new();
-        calc.set_base(Base::Hex);
-        for ch in ["A", "B", "C"] {
-            calc.handle_key(&key(ch, Some(ch)));
-        }
-        assert_eq!(calc.display(), "ABC");
+
+        // 2 + 3 × 4 = 14
+        calc.apply_action(Action::Digit('2'));
+        assert_eq!(calc.value(), 2);
+        calc.apply_action(Action::Operator(BinOp::Add));
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::Operator(BinOp::Mul));
+        calc.apply_action(Action::Digit('4'));
+        calc.apply_action(Action::Equals);
+        assert_eq!(calc.value(), 14);
+
+        calc.apply_action(Action::Clear);
+        assert_eq!(calc.value(), 0);
+        assert!(calc.expression().is_empty());
+
+        // 括号与位运算：(2 + 3) AND 6 = 5 AND 6 = 4
+        calc.apply_action(Action::OpenParen);
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::Operator(BinOp::Add));
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::CloseParen);
+        calc.apply_action(Action::Operator(BinOp::And));
+        calc.apply_action(Action::Digit('6'));
+        calc.apply_action(Action::Equals);
+        assert_eq!(calc.value(), 4);
+    }
+
+    #[test]
+    fn apply_action_hex_digits_and_bitwise_not() {
+        let mut calc = ProgrammerCalc::new();
+        calc.apply_action(Action::SetBase(Base::Hex));
+        calc.apply_action(Action::Digit('A'));
+        calc.apply_action(Action::Digit('F'));
+        assert_eq!(calc.display(), "AF");
+
+        // NOT AF = 50 (全 1 取反，按 QWORD)
+        calc.apply_action(Action::BitwiseNot);
+        assert_eq!(calc.value(), !0xAF);
+
+        // 翻转第 0 位
+        calc.apply_action(Action::ToggleBit(0));
+        assert_eq!(calc.value(), !0xAF ^ 1);
+    }
+
+    #[test]
+    fn apply_action_set_base_and_word() {
+        let mut calc = ProgrammerCalc::new();
+        calc.apply_action(Action::SetBase(Base::Hex));
+        assert_eq!(calc.base, Base::Hex);
+
+        calc.apply_action(Action::SetWord(WordSize::Byte));
+        assert_eq!(calc.word, WordSize::Byte);
+        // 位宽切换截断高位。
+        calc.apply_action(Action::Digit('F'));
+        calc.apply_action(Action::Digit('F'));
+        calc.apply_action(Action::Digit('0')); // FF0 截断到 F0
+        assert_eq!(calc.value(), 0xF0);
+    }
+
+    #[test]
+    fn apply_action_clear_entry_preserves_expression() {
+        let mut calc = ProgrammerCalc::new();
+        calc.apply_action(Action::Digit('1'));
+        calc.apply_action(Action::Operator(BinOp::Add));
+        calc.apply_action(Action::Digit('2'));
+        calc.apply_action(Action::ClearEntry);
+        assert_eq!(calc.value(), 0);
+        calc.apply_action(Action::Digit('3'));
+        calc.apply_action(Action::Equals);
+        assert_eq!(calc.value(), 4);
     }
 
     #[test]

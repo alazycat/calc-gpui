@@ -31,15 +31,13 @@ pub use theme::ThemePref;
 use crate::modes::programmer::ProgrammerCalc;
 use crate::modes::scientific::{self, ScientificCalc};
 use crate::modes::standard::{self, StandardCalc};
+use crate::shared::history;
 use crate::shared::storage;
 use crate::tools::converter::ConverterState;
 use crate::tools::date::DateCalc;
 use crate::tools::graph::GraphState;
 use gpui_kit::*;
 use std::time::{Duration, Instant};
-
-/// 历史记录最多保留的条数。
-const MAX_HISTORY: usize = 50;
 
 /// 应用根视图。
 pub struct CalcApp {
@@ -93,8 +91,7 @@ impl CalcApp {
 
         // 恢复历史记录与记忆槽。
         let mut standard = StandardCalc::new();
-        let start = saved.standard_history.len().saturating_sub(MAX_HISTORY);
-        standard.history = saved.standard_history[start..]
+        standard.history = history::recent(&saved.standard_history)
             .iter()
             .map(|entry| standard::HistoryEntry {
                 expression: entry.expression.clone(),
@@ -104,8 +101,7 @@ impl CalcApp {
         standard.memory.replace(saved.standard_memories.clone());
 
         let mut scientific = ScientificCalc::new();
-        let start = saved.scientific_history.len().saturating_sub(MAX_HISTORY);
-        scientific.history = saved.scientific_history[start..]
+        scientific.history = history::recent(&saved.scientific_history)
             .iter()
             .map(|entry| scientific::HistoryEntry {
                 expression: entry.expression.clone(),
