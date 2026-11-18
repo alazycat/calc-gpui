@@ -2,7 +2,9 @@
 //!
 //! 支持 `+ - * / % ^`、括号、隐式乘法（`2x`、`(x+1)(x-1)`）、
 //! 常量 `pi`/`e`、变量 `x`，以及 sin/cos/tan、ln/log、sqrt/abs 等函数。
-//! 这里只做纯计算，不涉及任何界面。
+//!
+//! 顶层还可以写成 `y = ...`（等价于只写右边）和不等式 `y > 2x`、`y ≤ x^2`，
+//! 后者会画成半平面。这里只做纯计算，不涉及任何界面。
 
 /// 二元运算符。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,6 +32,9 @@ pub enum FnKind {
     Sqrt,
     Cbrt,
     Abs,
+    Asinh,
+    Acosh,
+    Atanh,
     Ln,
     Log10,
     Exp,
@@ -50,6 +55,9 @@ impl FnKind {
             "sinh" => FnKind::Sinh,
             "cosh" => FnKind::Cosh,
             "tanh" => FnKind::Tanh,
+            "asinh" => FnKind::Asinh,
+            "acosh" => FnKind::Acosh,
+            "atanh" => FnKind::Atanh,
             "sqrt" => FnKind::Sqrt,
             "cbrt" => FnKind::Cbrt,
             "abs" => FnKind::Abs,
@@ -74,6 +82,9 @@ impl FnKind {
             FnKind::Sinh => value.sinh(),
             FnKind::Cosh => value.cosh(),
             FnKind::Tanh => value.tanh(),
+            FnKind::Asinh => value.asinh(),
+            FnKind::Acosh => value.acosh(),
+            FnKind::Atanh => value.atanh(),
             FnKind::Sqrt => value.sqrt(),
             FnKind::Cbrt => value.cbrt(),
             FnKind::Abs => value.abs(),
@@ -121,6 +132,76 @@ impl Expr {
     }
 }
 
+/// 不等式的关系符。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelKind {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl RelKind {
+    /// `y < f(x)` 与 `f(x) > y` 表达的是同一个区域。
+    pub fn flipped(self) -> Self {
+        match self {
+            RelKind::Lt => RelKind::Gt,
+            RelKind::Le => RelKind::Ge,
+            RelKind::Gt => RelKind::Lt,
+            RelKind::Ge => RelKind::Le,
+        }
+    }
+
+    /// 是否是严格不等式（边界不包含在区域内）。
+    pub fn is_strict(self) -> bool {
+        matches!(self, RelKind::Lt | RelKind::Gt)
+    }
+
+    /// 区域是否在边界曲线上方。
+    pub fn fills_above(self) -> bool {
+        matches!(self, RelKind::Gt | RelKind::Ge)
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            RelKind::Lt => "<",
+            RelKind::Le => "≤",
+            RelKind::Gt => ">",
+            RelKind::Ge => "≥",
+        }
+    }
+}
+
+/// 一条可绘制的东西：函数曲线，或不等式围成的半平面。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Plot {
+    /// `y = f(x)`。
+    Curve(Expr),
+    /// `y <rel> f(x)`：边界是 `rhs`，区域在它上方或下方。
+    Inequality { rel: RelKind, rhs: Expr },
+}
+
+impl Plot {
+    /// 边界上的值：曲线本身，或不等式的边界曲线。
+    pub fn eval(&self, x: f64) -> f64 {
+        match self {
+            Plot::Curve(expr) => expr.eval(x),
+            Plot::Inequality { rhs, .. } => rhs.eval(x),
+        }
+    }
+
+    pub fn relation(&self) -> Option<RelKind> {
+        match self {
+            Plot::Curve(_) => None,
+            Plot::Inequality { rel, .. } => Some(*rel),
+        }
+    }
+
+    pub fn is_inequality(&self) -> bool {
+        self.relation().is_some()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
     Num(f64),
@@ -133,6 +214,9 @@ enum Tok {
     Caret,
     LParen,
     RParen,
+    /// 等号（只允许 `y = ...` 这种写法）。
+    Assign,
+    Rel(RelKind),
 }
 
 /// 把文本切成 token。
@@ -178,6 +262,36 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
             }
             '+' => {
                 tokens.push(Tok::Plus);
+                pos += 1;
+            }
+            '=' => {
+                tokens.push(Tok::Assign);
+                pos += 1;
+            }
+            '<' => {
+                if chars.get(pos + 1) == Some(&'=') {
+                    tokens.push(Tok::Rel(RelKind::Le));
+                    pos += 2;
+                } else {
+                    tokens.push(Tok::Rel(RelKind::Lt));
+                    pos += 1;
+                }
+            }
+            '>' => {
+                if chars.get(pos + 1) == Some(&'=') {
+                    tokens.push(Tok::Rel(RelKind::Ge));
+                    pos += 2;
+                } else {
+                    tokens.push(Tok::Rel(RelKind::Gt));
+                    pos += 1;
+                }
+            }
+            '≤' => {
+                tokens.push(Tok::Rel(RelKind::Le));
+                pos += 1;
+            }
+            '≥' => {
+                tokens.push(Tok::Rel(RelKind::Ge));
                 pos += 1;
             }
             '-' | '−' => {
@@ -352,9 +466,62 @@ impl Parser {
     }
 }
 
-/// 解析 `y = ...` 右边的表达式。
-pub fn parse(input: &str) -> Result<Expr, String> {
+/// 解析一条完整的绘图语句：函数或不等式。
+///
+/// 四种写法等价：`x^2`、`y = x^2`、`y > x^2`、`x^2 < y`。
+pub fn parse_plot(input: &str) -> Result<Plot, String> {
     let tokens = tokenize(input)?;
+    if tokens.is_empty() {
+        return Err("请输入表达式".to_string());
+    }
+
+    let Some(position) = tokens
+        .iter()
+        .position(|token| matches!(token, Tok::Assign | Tok::Rel(_)))
+    else {
+        return Ok(Plot::Curve(parse_tokens(tokens)?));
+    };
+
+    let left = &tokens[..position];
+    let right = &tokens[position + 1..];
+    if right.is_empty() {
+        return Err("等号/不等号右边缺少表达式".to_string());
+    }
+
+    match &tokens[position] {
+        // `y = ...`：等号只是标注，不参与计算。
+        Tok::Assign => {
+            if !is_y(left) {
+                return Err("等号左边只能是 y".to_string());
+            }
+            Ok(Plot::Curve(parse_tokens(right.to_vec())?))
+        }
+        // `y <rel> f(x)`，或者反过来的 `f(x) <rel> y`。
+        Tok::Rel(rel) => {
+            if is_y(left) {
+                Ok(Plot::Inequality {
+                    rel: *rel,
+                    rhs: parse_tokens(right.to_vec())?,
+                })
+            } else if is_y(right) {
+                Ok(Plot::Inequality {
+                    rel: rel.flipped(),
+                    rhs: parse_tokens(left.to_vec())?,
+                })
+            } else {
+                Err("不等式必须有一边是 y".to_string())
+            }
+        }
+        _ => Err("表达式格式错误".to_string()),
+    }
+}
+
+/// 左边是否就是一个单独的 `y`。
+fn is_y(tokens: &[Tok]) -> bool {
+    matches!(tokens, [Tok::Ident(name)] if name == "y")
+}
+
+fn parse_tokens(tokens: Vec<Tok>) -> Result<Expr, String> {
     if tokens.is_empty() {
         return Err("请输入表达式".to_string());
     }

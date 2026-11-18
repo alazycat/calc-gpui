@@ -2,14 +2,23 @@
 //!
 //! 这一步是纯几何计算，在 `prepaint` 阶段算好，`paint` 只负责画。
 
-use super::expr::Expr;
+use super::expr::{Plot, RelKind};
 use gpui_kit::*;
+
+/// 一条曲线及其配色。虚线的样式在采样时已经写进路径里。
+pub struct CurveShape {
+    pub path: Path<Pixels>,
+    /// 颜色序号（即表达式的下标）。
+    pub index: usize,
+}
 
 /// 一次绘制所需的全部几何数据，在 prepaint 里算好，paint 里只负责画。
 pub struct Scene {
     pub grid: Path<Pixels>,
     pub axes: Path<Pixels>,
-    pub curve: Option<Path<Pixels>>,
+    /// 不等式围成的半平面：`(路径, 颜色序号)`。
+    pub fills: Vec<(Path<Pixels>, usize)>,
+    pub curves: Vec<CurveShape>,
     pub labels: Vec<(ShapedLine, Point<Pixels>, Pixels)>,
 }
 
@@ -111,9 +120,92 @@ impl Projection {
     }
 }
 
+/// 在视口宽度上按像素采样一条曲线，返回 `(x, y)`。
+///
+/// 采样密度跟着像素宽度走：每个像素一列，缩小时不会丢失细节。
+fn samples(plot: &Plot, x_min: f64, x_max: f64, width: Pixels) -> Vec<(f64, f64)> {
+    let steps = width.as_f32().max(1.0).round() as usize;
+    (0..=steps)
+        .map(|index| {
+            let fraction = index as f64 / steps as f64;
+            let x = x_min + (x_max - x_min) * fraction;
+            (x, plot.eval(x))
+        })
+        .collect()
+}
+
+/// 把采样点连成曲线；遇到非有限值或跳变就断开，避开渐近线附近的竖线。
+fn build_curve(
+    plot: &Plot,
+    projection: &Projection,
+    bounds: &Bounds<Pixels>,
+    viewport: Viewport,
+    dashed: bool,
+) -> Option<Path<Pixels>> {
+    let mut builder = PathBuilder::stroke(px(2.0));
+    if dashed {
+        builder = builder.dash_array(&[px(6.0), px(4.0)]);
+    }
+    let mut started = false;
+    let mut previous_y = 0.0f32;
+
+    for (x, y) in samples(plot, viewport.x_min, viewport.x_max, projection.width) {
+        if !y.is_finite() {
+            started = false;
+            continue;
+        }
+        let point = projection.point(x, y);
+        let pixel_y = point.y.as_f32();
+        if started && (pixel_y - previous_y).abs() > bounds.size.height.as_f32() {
+            started = false;
+        }
+        if started {
+            builder.line_to(point);
+        } else {
+            builder.move_to(point);
+            started = true;
+        }
+        previous_y = pixel_y;
+    }
+    builder.build().ok()
+}
+
+/// 不等式围成的半平面。
+///
+/// 采样值先夹到视口高度内：高于顶边的点夹到顶边，于是那一列自动变成空的；
+/// 低于底边的点夹到底边，那一列就被整列填满。不需要单独的裁剪步骤。
+fn build_fill(
+    plot: &Plot,
+    rel: RelKind,
+    projection: &Projection,
+    viewport: Viewport,
+) -> Option<Path<Pixels>> {
+    let edge = if rel.fills_above() {
+        viewport.y_max
+    } else {
+        viewport.y_min
+    };
+
+    let mut points = Vec::with_capacity(64);
+    points.push(projection.point(viewport.x_min, edge));
+    for (x, y) in samples(plot, viewport.x_min, viewport.x_max, projection.width) {
+        let y = if y.is_finite() {
+            y.clamp(viewport.y_min, viewport.y_max)
+        } else {
+            edge
+        };
+        points.push(projection.point(x, y));
+    }
+    points.push(projection.point(viewport.x_max, edge));
+
+    let mut builder = PathBuilder::fill();
+    builder.add_polygon(&points, true);
+    builder.build().ok()
+}
+
 pub fn build_scene(
     bounds: Bounds<Pixels>,
-    expr: Option<&Expr>,
+    plots: &[(Plot, usize)],
     viewport: Viewport,
     window: &mut Window,
     label_color: Hsla,
@@ -171,38 +263,24 @@ pub fn build_scene(
     }
     let axes = axes.build().unwrap_or_else(|_| Path::new(bounds.origin));
 
-    // 曲线。
-    let curve = expr.and_then(|expr| {
-        let mut builder = PathBuilder::stroke(px(2.0));
-        let width = projection.width.as_f32().max(1.0);
-        let steps = width.round() as usize;
-        let mut started = false;
-        let mut previous_y = 0.0f32;
-
-        for index in 0..=steps {
-            let fraction = index as f64 / steps as f64;
-            let x = x_min + (x_max - x_min) * fraction;
-            let y = expr.eval(x);
-            if !y.is_finite() {
-                started = false;
-                continue;
-            }
-            let point = projection.point(x, y);
-            let pixel_y = point.y.as_f32();
-            // 渐近线两侧的值会突然跳变，断开路径避免画出一条竖线。
-            if started && (pixel_y - previous_y).abs() > bounds.size.height.as_f32() {
-                started = false;
-            }
-            if started {
-                builder.line_to(point);
-            } else {
-                builder.move_to(point);
-                started = true;
-            }
-            previous_y = pixel_y;
+    // 曲线与半平面。
+    let mut fills = Vec::new();
+    let mut curves = Vec::new();
+    for (plot, index) in plots {
+        let relation = plot.relation();
+        if let Some(rel) = relation
+            && let Some(path) = build_fill(plot, rel, &projection, viewport)
+        {
+            fills.push((path, *index));
         }
-        builder.build().ok()
-    });
+        let dashed = relation.is_some_and(RelKind::is_strict);
+        if let Some(path) = build_curve(plot, &projection, &bounds, viewport, dashed) {
+            curves.push(CurveShape {
+                path,
+                index: *index,
+            });
+        }
+    }
 
     // 刻度标签。
     let font = Font::default();
@@ -287,7 +365,8 @@ pub fn build_scene(
     Scene {
         grid,
         axes,
-        curve,
+        fills,
+        curves,
         labels,
     }
 }

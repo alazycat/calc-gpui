@@ -1,9 +1,14 @@
-//! 「绘图」模式：输入 y = f(x)，在坐标系里画出函数曲线。
+//! 「绘图」模式：一次可以画多条表达式，每条是函数或不等式。
 //!
 //! - 表达式解析器支持 `+ - * / % ^`、括号、隐式乘法（`2x`、`(x+1)(x-1)`）、
 //!   常量 `pi`/`e`、变量 `x`，以及 sin/cos/tan、ln/log、sqrt/abs 等函数；
+//! - 顶层写法有四种等价/扩展：`x^2`、`y = x^2`、`y > x^2`、`x^2 <= y`；
+//!   不等式画成半平面（严格不等式用虚线边界）；
+//! - 每条表达式有自己的颜色、可见性和解析错误，视口是共用的；
 //! - 曲线在 GPUI canvas 里绘制，带网格、坐标轴和刻度标签；
-//! - 支持放大 / 缩小 / 平移 / 自动适配 y 轴。
+//! - 支持放大 / 缩小 / 平移 / 自动适配 y 轴；
+//! - 界面有两种视图：「坐标系」和「表达式列表」（右上角切换），
+//!   底部数学键盘（含三角学 / 不等式 / 函数三个面板与 `2ⁿᵈ`）作用于选中的表达式。
 //!
 //! 按「解析 → 状态 → 几何 → 绘制」拆成四个子模块，依赖方向单向：
 //!
@@ -24,9 +29,17 @@ pub use view::{keystroke_to_action, render};
 
 #[cfg(test)]
 mod tests {
-    use super::expr::{Expr, parse};
+    use super::expr::{Expr, Plot, RelKind, parse_plot};
     use super::scene::{format_tick, nice_step, ticks};
     use super::state::GraphState;
+
+    /// 测试专用：只要函数那一半，不等式在别处单独测。
+    fn parse(input: &str) -> Result<Expr, String> {
+        match parse_plot(input)? {
+            Plot::Curve(expr) => Ok(expr),
+            Plot::Inequality { .. } => Err("这不是函数".to_string()),
+        }
+    }
 
     fn eval(input: &str, x: f64) -> f64 {
         parse(input).expect("表达式应能解析").eval(x)
@@ -93,7 +106,7 @@ mod tests {
         state.input_char('*');
         state.input_char('3');
         assert_eq!(state.copy_text(), "2*3");
-        assert!(state.plotted.is_some());
+        assert!(state.active_plot().is_some());
 
         // 光标：回到开头插入。
         state.move_home();
@@ -132,6 +145,57 @@ mod tests {
         assert!(state.y_min >= -11.0);
         assert!(state.y_max >= 100.0);
         assert!(state.y_max <= 111.0);
+    }
+
+    #[test]
+    fn parses_inequalities_with_y() {
+        // y 在左边：区域在上方。
+        let plot = parse_plot("y > 2x").expect("不等式应能解析");
+        assert_eq!(
+            plot,
+            Plot::Inequality {
+                rel: RelKind::Gt,
+                rhs: parse("2x").unwrap()
+            }
+        );
+        assert!(plot.is_inequality());
+        assert_eq!(plot.relation(), Some(RelKind::Gt));
+        assert_eq!(plot.eval(3.0), 6.0);
+
+        // y 在右边：关系符反过来。
+        let plot = parse_plot("x^2 <= y").expect("不等式应能解析");
+        assert_eq!(
+            plot,
+            Plot::Inequality {
+                rel: RelKind::Ge,
+                rhs: parse("x^2").unwrap()
+            }
+        );
+
+        // 两边都没有 y 就不是不等式。
+        assert!(parse_plot("x > 2").is_err());
+        // y 只能单独出现在一边。
+        assert!(parse_plot("y + 1 > 2").is_err());
+    }
+
+    #[test]
+    fn equals_sign_is_just_a_label() {
+        // `y = x^2` 与 `x^2` 是同一条曲线。
+        assert_eq!(parse_plot("y = x^2"), parse_plot("x^2"));
+        assert_eq!(parse_plot("x^2"), Ok(Plot::Curve(parse("x^2").unwrap())));
+        // 等号左边不是 y 就没意义。
+        assert!(parse_plot("2 = x").is_err());
+        // 等号右边不能为空。
+        assert!(parse_plot("y =").is_err());
+    }
+
+    #[test]
+    fn relation_helpers_are_consistent() {
+        assert_eq!(RelKind::Lt.flipped(), RelKind::Gt);
+        assert_eq!(RelKind::Ge.flipped(), RelKind::Le);
+        assert!(RelKind::Lt.is_strict() && !RelKind::Le.is_strict());
+        assert!(RelKind::Gt.fills_above() && !RelKind::Lt.fills_above());
+        assert_eq!(RelKind::Le.symbol(), "≤");
     }
 
     #[test]
